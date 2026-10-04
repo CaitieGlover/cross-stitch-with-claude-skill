@@ -1,0 +1,10 @@
+{
+  "name": "cross-stitch",
+  "version": "0.1.0",
+  "description": "Create and edit cross-stitch patterns in the OXS (Open Cross Stitch) format, with DMC thread matching.",
+  "author": {
+    "name": "Caitlin Glover"
+  },
+  "repository": "https://github.com/caitieglover/cross-stitch-with-claude-skill",
+  "license": "GPL-3.0"
+}

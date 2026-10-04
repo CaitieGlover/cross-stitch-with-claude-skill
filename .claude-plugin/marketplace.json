@@ -1,0 +1,13 @@
+{
+  "name": "cross-stitch-with-claude",
+  "owner": {
+    "name": "Caitlin Glover"
+  },
+  "plugins": [
+    {
+      "name": "cross-stitch",
+      "source": "./",
+      "description": "Create and edit cross-stitch patterns in the OXS (Open Cross Stitch) format, with DMC thread matching."
+    }
+  ]
+}
