@@ -39,7 +39,10 @@ pip install -r <skill-dir>/scripts/requirements.txt
    - **Width in stitches.** 50-150 is typical. On 14-count fabric, 70
      stitches is 5 in / 12.7 cm. Faces, eyes and small text need roughly 60+
      stitches across the whole design; small motifs can go lower.
-   - **Maximum colours.** 10-20 is typical; default 15.
+   - **Maximum colours.** 10-20 is typical; default 15. The result often
+     uses fewer: near-duplicate colours, and similar colours used for only a
+     few stitches, are merged so the stitcher is not buying a skein for a
+     handful of stitches.
    - **Fabric colour** if not white, and fabric count if not 14.
    - If only part of the image is wanted, a crop box in source pixels.
 
@@ -52,6 +55,12 @@ pip install -r <skill-dir>/scripts/requirements.txt
    ```
 
    Other options:
+   - `--style auto|illustration|photo`. `illustration` gives each stitch the
+     single thread that covers most of its square, which keeps flat-colour
+     artwork crisp with no in-between blend colours. `photo` averages each
+     square, which suits gradients and texture. `auto` (default) picks from
+     the image; the summary's `style` field says which was used. Override it
+     if the result looks wrong for the image.
    - `--fabric HEX` (default `FFFFFF`)
    - `--count N` (stitches per inch, default 14)
    - `--crop left,top,right,bottom`
@@ -59,7 +68,7 @@ pip install -r <skill-dir>/scripts/requirements.txt
      unstitched only when it is close to the fabric colour. `remove` always
      leaves the edge-connected background unstitched. `keep` stitches
      everything.
-   - `--keep-edges` turns off clean-up of the blended one-stitch outline
+   - `--keep-edges` (photo style) turns off clean-up of the blended one-stitch outline
      between subject and background. Use it if a pale edge of the subject
      has been trimmed.
    - `--no-despeckle` keeps every isolated single stitch.

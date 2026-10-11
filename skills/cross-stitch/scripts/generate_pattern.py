@@ -41,6 +41,9 @@ def main(argv=None):
     p.add_argument("--title", default="", help="chart title")
     p.add_argument("--metric", choices=["lab", "rgb"], default="lab", help="colour distance (default lab = CIEDE2000)")
     p.add_argument("--no-despeckle", action="store_true", help="keep isolated single stitches as they are")
+    p.add_argument("--style", choices=["auto", "illustration", "photo"], default="auto",
+                   help="illustration: one solid colour per stitch, best for flat artwork; "
+                        "photo: averaged colour, best for photographs; auto (default) picks one")
     p.add_argument("--keep-edges", action="store_true", help="do not tidy blended outline stitches next to the background")
     args = p.parse_args(argv)
 
@@ -52,6 +55,7 @@ def main(argv=None):
         crop=args.crop,
         despeckle=not args.no_despeckle,
         clean_edges=not args.keep_edges,
+        style=args.style,
         metric=args.metric,
         stitches_per_inch=args.count,
         title=args.title,

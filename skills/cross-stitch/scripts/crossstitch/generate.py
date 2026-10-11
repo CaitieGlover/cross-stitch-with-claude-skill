@@ -1,13 +1,21 @@
 """Image -> cross-stitch pattern.
 
-Pipeline: load -> crop -> downsample to the stitch grid -> mark background
-as unstitched -> k-means colour reduction -> match to DMC -> clean up stray
+Pipeline: load -> crop -> mark background as unstitched -> k-means colour
+reduction -> match to DMC -> one colour per stitch -> clean up stray
 stitches -> Pattern.
+
+Two ways of picking each stitch's colour, chosen automatically:
+
+- "illustration" (flat-colour artwork, clip art, logos): every source pixel
+  is matched to a thread first, then each stitch takes the thread covering
+  most of its square. No in-between colours are invented at edges, so
+  outlines stay crisp and colour slots are not wasted on blends.
+- "photo": each stitch is the average colour of its square, then matched.
+  Averaging suits gradients and texture.
 """
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
@@ -23,11 +31,21 @@ DETAIL_WARN_WIDTH = 60
 SEVERE_DETAIL_WARN_WIDTH = 35
 # CIEDE2000 distance under which a colour counts as "the fabric".
 BACKGROUND_TOLERANCE = 10.0
-# How far (Lab units) an edge cell may sit from the background-to-subject
-# blend line and still be treated as a blend.
-HALO_RESIDUAL = 6.0
+# How far (RGB units) an edge cell may sit from the background-to-subject
+# blend line and still be treated as a blend. Area averaging mixes colours
+# in RGB, so blends lie on straight lines in RGB, not in Lab.
+HALO_RESIDUAL = 14.0
+# Illustration mode samples each stitch on a grid of up to this many pixels square.
+SAMPLES_PER_STITCH = 8
+STYLES = ("auto", "illustration", "photo")
 # An isolated stitch is merged into its neighbours only if they are this close in colour.
 DESPECKLE_MAX_DELTA = 12.0
+# A thread used for fewer stitches than this share of the pattern (or
+# MIN_THREAD_STITCHES, whichever is larger) is folded into the closest
+# remaining thread, if that thread is within RARE_MERGE_MAX_DELTA.
+MIN_THREAD_SHARE = 0.005
+MIN_THREAD_STITCHES = 10
+RARE_MERGE_MAX_DELTA = 15.0
 
 
 @dataclass
@@ -47,6 +65,8 @@ class GenerateOptions:
     stitches_per_inch: int = 14
     title: str = ""
     seed: int = 0
+    # "auto" picks "illustration" for flat-colour artwork and "photo" otherwise.
+    style: str = "auto"
 
 
 @dataclass
@@ -62,9 +82,31 @@ def load_image(source: Union[str, Image.Image]) -> Image.Image:
     return img.convert("RGBA")
 
 
-def downsample(img: Image.Image, width: int) -> np.ndarray:
-    """Resize to ``width`` stitches (square stitches, aspect kept). Returns RGBA uint8 array."""
-    height = max(1, round(width * img.height / img.width))
+def grid_height(img: Image.Image, width: int) -> int:
+    return max(1, round(width * img.height / img.width))
+
+
+def detect_style(img: Image.Image) -> str:
+    """'illustration' for flat-colour artwork, 'photo' otherwise.
+
+    Flat artwork has no colour change between most neighbouring pixels, so
+    the median neighbour difference is near zero; photos have texture and
+    noise everywhere.
+    """
+    small = img.convert("RGB")
+    small.thumbnail((400, 400))
+    lab = dmc_match.rgb_to_lab(np.asarray(small, dtype=np.float64))
+    dx = np.linalg.norm(np.diff(lab, axis=1), axis=2)[:-1, :]
+    dy = np.linalg.norm(np.diff(lab, axis=0), axis=2)[:, :-1]
+    step = np.maximum(dx, dy)
+    return "illustration" if float(np.median(step)) < 0.8 else "photo"
+
+
+def downsample(img: Image.Image, width: int, samples: int = 1) -> np.ndarray:
+    """Resize to ``width`` stitches (square stitches, aspect kept), with
+    ``samples`` x ``samples`` pixels per stitch. Returns RGBA uint8 array."""
+    height = grid_height(img, width)
+    width, height = width * samples, height * samples
     # Area averaging: each stitch is the mean colour of the pixels it covers.
     # Unlike sharpening filters, it never overshoots at edges, so outline
     # cells are clean blends that clean_halo() can recognise.
@@ -75,49 +117,52 @@ def downsample(img: Image.Image, width: int) -> np.ndarray:
 # ---------------------------------------------------------------- background
 
 
-def _border_pixels(mask_shape) -> list[tuple[int, int]]:
-    h, w = mask_shape
-    pts = [(0, x) for x in range(w)] + [(h - 1, x) for x in range(w)]
-    pts += [(y, 0) for y in range(h)] + [(y, w - 1) for y in range(h)]
-    return pts
+def _border_mask(shape) -> np.ndarray:
+    m = np.zeros(shape, dtype=bool)
+    m[0, :] = m[-1, :] = m[:, 0] = m[:, -1] = True
+    return m
+
+
+def _dilate(mask: np.ndarray) -> np.ndarray:
+    out = mask.copy()
+    out[1:, :] |= mask[:-1, :]
+    out[:-1, :] |= mask[1:, :]
+    out[:, 1:] |= mask[:, :-1]
+    out[:, :-1] |= mask[:, 1:]
+    return out
 
 
 def _flood_from_border(similar: np.ndarray) -> np.ndarray:
     """Cells connected to the image edge through ``similar`` cells (4-connected)."""
-    h, w = similar.shape
-    out = np.zeros_like(similar)
-    queue = deque()
-    for y, x in _border_pixels(similar.shape):
-        if similar[y, x] and not out[y, x]:
-            out[y, x] = True
-            queue.append((y, x))
-    while queue:
-        y, x = queue.popleft()
-        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
-            if 0 <= ny < h and 0 <= nx < w and similar[ny, nx] and not out[ny, nx]:
-                out[ny, nx] = True
-                queue.append((ny, nx))
-    return out
+    out = similar & _border_mask(similar.shape)
+    while True:
+        grown = _dilate(out) & similar
+        if np.array_equal(grown, out):
+            return out
+        out = grown
 
 
-def background_mask(lab: np.ndarray, opaque: np.ndarray, mode: str, fabric_rgb) -> tuple[np.ndarray, Optional[str]]:
-    """Return (mask of cells to leave unstitched, note for the user or None)."""
+def background_mask(
+    lab: np.ndarray, opaque: np.ndarray, mode: str, fabric_rgb
+) -> tuple[np.ndarray, Optional[str], Optional[np.ndarray]]:
+    """Return (mask of cells to leave unstitched, note for the user or None,
+    Lab colour of the removed background or None)."""
     empty = ~opaque
     if mode == "keep":
-        return empty, None
-    h, w = opaque.shape
-    border = [(y, x) for y, x in _border_pixels((h, w)) if opaque[y, x]]
-    if not border:
-        return empty, None
+        return empty, None, None
+    border_lab = lab[_border_mask(opaque.shape) & opaque]
+    if not len(border_lab):
+        return empty, None, None
+    if len(border_lab) > 600:
+        border_lab = border_lab[np.linspace(0, len(border_lab) - 1, 600).astype(int)]
 
-    border_lab = np.array([lab[y, x] for y, x in border])
     # Dominant border colour: the border pixel with the most near neighbours on the border.
     d = dmc_match.delta_e2000(border_lab[:, None, :], border_lab[None, :, :])
     support = (d < BACKGROUND_TOLERANCE).sum(axis=1)
     bg_lab = border_lab[support.argmax()]
-    share = support.max() / len(border)
+    share = support.max() / len(border_lab)
     if share < 0.5:
-        return empty, None
+        return empty, None, None
 
     fabric_lab = dmc_match.rgb_to_lab(np.asarray(fabric_rgb))
     if mode == "auto":
@@ -125,22 +170,24 @@ def background_mask(lab: np.ndarray, opaque: np.ndarray, mode: str, fabric_rgb) 
             return empty, (
                 "The image background is not close to the fabric colour, so it has been "
                 "stitched. Use the 'remove' background option to leave it unstitched instead."
-            )
+            ), None
     dist = dmc_match.delta_e2000(lab, bg_lab)
     bg = _flood_from_border(opaque & (dist < BACKGROUND_TOLERANCE))
-    return empty | bg, None
+    return empty | bg, None, bg_lab
 
 
-def clean_halo(lab: np.ndarray, unstitched: np.ndarray, background_lab: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def clean_halo(rgb: np.ndarray, unstitched: np.ndarray, background_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Fix the one-stitch ring where downsampling blended the subject into the background.
 
     A cell touching the background whose colour lies on the line between the
     background and a neighbouring subject colour is a blend. If it is mostly
     background it is left unstitched; otherwise it takes the subject colour.
-    Returns updated (lab, unstitched) arrays.
+    Works in RGB because area averaging blends colours in RGB.
+    Returns updated (rgb, unstitched) arrays.
     """
     h, w = unstitched.shape
-    lab = lab.copy()
+    rgb = rgb.copy()
+    background_rgb = np.asarray(background_rgb, dtype=np.float64)
     unstitched = unstitched.copy()
     bg = unstitched
     changes = []
@@ -151,22 +198,22 @@ def clean_halo(lab: np.ndarray, unstitched: np.ndarray, background_lab: np.ndarr
             neigh = [(y + dy, x + dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy or dx) and 0 <= y + dy < h and 0 <= x + dx < w]
             if not any(bg[p] for p in neigh):
                 continue
-            c = lab[y, x]
+            c = rgb[y, x]
             best = None
             # Compare against subject colours up to two cells away.
             reach = [(y + dy, x + dx) for dy in range(-2, 3) for dx in range(-2, 3) if (dy or dx) and 0 <= y + dy < h and 0 <= x + dx < w]
             for p in reach:
                 if bg[p]:
                     continue
-                s = lab[p]
-                seg = s - background_lab
+                s = rgb[p]
+                seg = s - background_rgb
                 denom = float(seg @ seg)
                 if denom < 1e-6:
                     continue
-                t = float((c - background_lab) @ seg) / denom
+                t = float((c - background_rgb) @ seg) / denom
                 if not 0.0 < t < 1.0:
                     continue
-                residual = float(np.linalg.norm(c - (background_lab + t * seg)))
+                residual = float(np.linalg.norm(c - (background_rgb + t * seg)))
                 if residual < HALO_RESIDUAL and (best is None or residual < best[0]):
                     best = (residual, t, s)
             if best is not None:
@@ -175,8 +222,8 @@ def clean_halo(lab: np.ndarray, unstitched: np.ndarray, background_lab: np.ndarr
         if t < 0.5:
             unstitched[y, x] = True
         else:
-            lab[y, x] = s
-    return lab, unstitched
+            rgb[y, x] = s
+    return rgb, unstitched
 
 
 # ---------------------------------------------------------------- quantisation
@@ -319,6 +366,40 @@ def despeckle(cells: np.ndarray, palette_lab: np.ndarray, max_delta: float = DES
     return out, changed
 
 
+def fold_rare_threads(cells: np.ndarray, palette_lab: np.ndarray) -> tuple[np.ndarray, list[int]]:
+    """Merge threads used for only a handful of stitches into a similar thread.
+
+    A colour that appears a few times and looks like another colour already
+    in the pattern costs the stitcher a skein for almost nothing. Rare
+    colours that are clearly different (an eye, a highlight) are kept.
+    Returns (cells, palette indices that were folded away).
+    """
+    cells = cells.copy()
+    folded: list[int] = []
+    while True:
+        counts = np.bincount(cells.ravel(), minlength=len(palette_lab))
+        counts[CLOTH] = 0
+        total = int(counts.sum())
+        if not total:
+            return cells, folded
+        limit = max(MIN_THREAD_STITCHES, MIN_THREAD_SHARE * total)
+        used = [i for i in range(1, len(palette_lab)) if counts[i] > 0]
+        best = None
+        for i in sorted(used, key=lambda i: counts[i]):
+            if counts[i] >= limit or len(used) < 2:
+                break
+            others = [j for j in used if j != i]
+            d = dmc_match.delta_e2000(palette_lab[i][None, :], palette_lab[others])
+            j = int(np.argmin(d))
+            if float(d[j]) <= RARE_MERGE_MAX_DELTA:
+                best = (i, others[j])
+                break
+        if best is None:
+            return cells, folded
+        cells[cells == best[0]] = best[1]
+        folded.append(best[0])
+
+
 # ---------------------------------------------------------------- main entry
 
 
@@ -330,6 +411,8 @@ def generate_from_image(source: Union[str, Image.Image], options: Optional[Gener
         raise ValueError("max_colors must be between 1 and 60")
     if opts.background not in ("auto", "remove", "keep"):
         raise ValueError("background must be 'auto', 'remove' or 'keep'")
+    if opts.style not in STYLES:
+        raise ValueError(f"style must be one of {', '.join(STYLES)}")
 
     warnings: list[str] = []
     img = load_image(source)
@@ -341,52 +424,37 @@ def generate_from_image(source: Union[str, Image.Image], options: Optional[Gener
             f"The source image is only {img.width}px wide but the pattern is {opts.width} stitches wide, "
             "so it has been enlarged and may look soft."
         )
-
-    rgba = downsample(img, opts.width)
-    h, w = rgba.shape[:2]
-    rgb = rgba[..., :3].astype(np.float64)
-    opaque = rgba[..., 3] >= 128
-    lab = dmc_match.rgb_to_lab(rgb)
-
+    style = detect_style(img) if opts.style == "auto" else opts.style
+    w, h = opts.width, grid_height(img, opts.width)
     fabric_rgb = hex_to_rgb(opts.fabric)
-    unstitched, note = background_mask(lab, opaque, opts.background, fabric_rgb)
-    if note:
-        warnings.append(note)
-    if opts.clean_edges and unstitched.any():
-        # Edges blend towards the colour that was removed; transparent areas
-        # carry no colour, so use the fabric for them.
-        removed = unstitched & opaque
-        if removed.any():
-            edge_lab = lab[removed].mean(axis=0)
-        else:
-            edge_lab = dmc_match.rgb_to_lab(np.asarray(fabric_rgb, dtype=np.float64))
-        lab, unstitched = clean_halo(lab, unstitched, edge_lab)
-    stitched = ~unstitched
 
     pattern = Pattern.blank(w, h, cloth_hex=opts.fabric.upper(), title=opts.title)
     pattern.properties["stitchesperinch"] = str(opts.stitches_per_inch)
-    if not stitched.any():
+
+    if style == "illustration":
+        cells, threads, note = _cells_illustration(img, w, h, opts, fabric_rgb)
+    else:
+        cells, threads, note = _cells_photo(img, w, h, opts, fabric_rgb)
+    if note:
+        warnings.append(note)
+    if cells is None:
         warnings.append("Every cell was treated as background, so the pattern is empty.")
-        return GenerateResult(pattern, warnings, _stats(pattern, src_size, opts, 0))
+        return GenerateResult(pattern, warnings, _stats(pattern, src_size, opts, 0, style))
 
-    pix = lab[stitched]
-    threads = choose_threads(pix, opts.max_colors, opts.metric, opts.seed)
-    which = assign(pix, threads)
-
-    # Order palette by usage (most-used first) and build the grid.
-    counts = np.bincount(which, minlength=len(threads))
+    # Order palette by usage (most-used first).
+    counts = np.bincount(cells[cells >= 0], minlength=len(threads))
     order = [i for i in np.argsort(-counts, kind="stable") if counts[i] > 0]
-    pal_index = {old: new + 1 for new, old in enumerate(order)}
-    for i in order:
-        pattern.palette.append(threads[i].palette_entry())
-    cells = np.zeros((h, w), dtype=np.int32)
-    cells[stitched] = np.array([pal_index[i] for i in which], dtype=np.int32)
+    lut = np.zeros(len(threads) + 1, dtype=np.int32)  # index -1 (unstitched) -> cloth
+    for new, old in enumerate(order):
+        lut[old] = new + 1
+        pattern.palette.append(threads[old].palette_entry())
+    pattern.cells = lut[cells]
 
     removed = 0
+    pal_lab = dmc_match.rgb_to_lab(np.array([e.rgb for e in pattern.palette], dtype=np.float64))
     if opts.despeckle:
-        pal_lab = dmc_match.rgb_to_lab(np.array([e.rgb for e in pattern.palette], dtype=np.float64))
-        cells, removed = despeckle(cells, pal_lab)
-    pattern.cells = cells
+        pattern.cells, removed = despeckle(pattern.cells, pal_lab)
+    pattern.cells, folded = fold_rare_threads(pattern.cells, pal_lab)
     _drop_unused(pattern)
 
     if w < SEVERE_DETAIL_WARN_WIDTH:
@@ -399,7 +467,62 @@ def generate_from_image(source: Union[str, Image.Image], options: Optional[Gener
             f"At {w} stitches wide, fine detail (eyes, facial features, small text) may not read clearly. "
             "Check the preview; a wider pattern keeps more detail."
         )
-    return GenerateResult(pattern, warnings, _stats(pattern, src_size, opts, removed))
+    return GenerateResult(pattern, warnings, _stats(pattern, src_size, opts, removed, style))
+
+
+def _cells_photo(img, w, h, opts, fabric_rgb):
+    """Average colour per stitch. Returns (cells with -1 for unstitched, threads, note)."""
+    rgba = downsample(img, w)
+    rgb = rgba[..., :3].astype(np.float64)
+    opaque = rgba[..., 3] >= 128
+    lab = dmc_match.rgb_to_lab(rgb)
+    unstitched, note, bg_lab = background_mask(lab, opaque, opts.background, fabric_rgb)
+    if opts.clean_edges and unstitched.any():
+        # Edges blend towards the colour that was removed; transparent areas
+        # carry no colour, so use the fabric for them.
+        removed = unstitched & opaque
+        edge_rgb = rgb[removed].mean(axis=0) if removed.any() else np.asarray(fabric_rgb, dtype=np.float64)
+        rgb, unstitched = clean_halo(rgb, unstitched, edge_rgb)
+        lab = dmc_match.rgb_to_lab(rgb)
+    stitched = ~unstitched
+    if not stitched.any():
+        return None, [], note
+    pix = lab[stitched]
+    threads = choose_threads(pix, opts.max_colors, opts.metric, opts.seed)
+    cells = np.full((h, w), -1, dtype=np.int32)
+    cells[stitched] = assign(pix, threads)
+    return cells, threads, note
+
+
+def _cells_illustration(img, w, h, opts, fabric_rgb):
+    """Majority thread per stitch. Returns (cells with -1 for unstitched, threads, note)."""
+    n = max(1, min(SAMPLES_PER_STITCH, img.width // w, img.height // h))
+    rgba = downsample(img, w, samples=n)
+    opaque = rgba[..., 3] >= 128
+    lab = dmc_match.rgb_to_lab(rgba[..., :3].astype(np.float64))
+    unstitched, note, _ = background_mask(lab, opaque, opts.background, fabric_rgb)
+    stitched = ~unstitched
+    if not stitched.any():
+        return None, [], note
+
+    pix = lab[stitched]
+    if len(pix) > 60000:
+        pix_sample = pix[np.random.default_rng(opts.seed).choice(len(pix), 60000, replace=False)]
+    else:
+        pix_sample = pix
+    threads = choose_threads(pix_sample, opts.max_colors, opts.metric, opts.seed)
+    labels = np.full(stitched.shape, -1, dtype=np.int32)
+    labels[stitched] = assign(pix, threads)
+
+    # Vote within each stitch's n x n block; slot 0 counts unstitched pixels.
+    k = len(threads) + 1
+    ys, xs = np.indices(labels.shape)
+    cell_id = (ys // n) * w + (xs // n)
+    votes = np.bincount((cell_id * k + labels + 1).ravel(), minlength=h * w * k).reshape(h, w, k)
+    winner = votes.argmax(axis=2) - 1
+    if not (winner >= 0).any():
+        return None, [], note
+    return winner.astype(np.int32), threads, note
 
 
 def _drop_unused(pattern: Pattern) -> None:
@@ -414,7 +537,7 @@ def _drop_unused(pattern: Pattern) -> None:
     pattern.palette = [pattern.palette[i] for i in keep]
 
 
-def _stats(pattern: Pattern, src_size, opts: GenerateOptions, despeckled: int) -> dict:
+def _stats(pattern: Pattern, src_size, opts: GenerateOptions, despeckled: int, style: str) -> dict:
     spi = opts.stitches_per_inch
     counts = pattern.stitch_counts()
     return {
@@ -427,6 +550,7 @@ def _stats(pattern: Pattern, src_size, opts: GenerateOptions, despeckled: int) -
         "finished_size_cm": [round(pattern.width / spi * 2.54, 1), round(pattern.height / spi * 2.54, 1)],
         "stitches_per_inch": spi,
         "isolated_stitches_merged": despeckled,
+        "style": style,
         "threads": [
             {"index": i, "number": e.number, "name": e.name, "hex": e.color, "stitches": counts.get(i, 0)}
             for i, e in enumerate(pattern.palette)

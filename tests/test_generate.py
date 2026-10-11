@@ -102,3 +102,49 @@ def test_preview_renders():
     p = generate_from_image(img, GenerateOptions(width=40)).pattern
     prev = render_preview(p, img)
     assert prev.width > 400 and prev.height > 300
+
+
+def gradient_photo():
+    """Smooth gradient plus noise: photo-like."""
+    rng = np.random.default_rng(3)
+    y, x = np.mgrid[0:200, 0:300]
+    arr = np.stack([x * 0.8, y * 1.2, 255 - x * 0.5], axis=-1) + rng.normal(0, 6, (200, 300, 3))
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+def test_detect_style():
+    from crossstitch.generate import detect_style
+    assert detect_style(flag_image()) == "illustration"
+    assert detect_style(gradient_photo()) == "photo"
+
+
+def test_illustration_mode_invents_no_blend_colours():
+    # Red and yellow halves meeting in the middle of stitches: averaging would
+    # create orange; majority voting must not.
+    img = Image.new("RGB", (205, 100), (200, 30, 40))
+    ImageDraw.Draw(img).rectangle([103, 0, 205, 100], fill=(250, 220, 0))
+    r = generate_from_image(img, GenerateOptions(width=20, style="illustration", background="keep"))
+    assert r.stats["style"] == "illustration"
+    assert len(r.pattern.palette) - 1 == 2
+    photo = generate_from_image(img, GenerateOptions(width=20, style="photo", background="keep", despeckle=False))
+    assert len(photo.pattern.palette) - 1 >= 2
+
+
+def test_photo_mode_cleans_outline_halo():
+    from PIL import ImageFilter
+    img = flag_image().filter(ImageFilter.GaussianBlur(3))
+    p = generate_from_image(img, GenerateOptions(width=40, max_colors=6, style="photo")).pattern
+    for e in p.palette[1:]:
+        r, g, b = e.rgb
+        assert not (r > 220 and g > 170 and b > 170), f"pale blend colour {e.number} left in pattern"
+
+
+def test_rare_similar_threads_are_folded():
+    from crossstitch.generate import fold_rare_threads
+    pal = rgb_to_lab(np.array([[255, 255, 255], [200, 30, 40], [205, 35, 45], [20, 40, 160]], dtype=float))
+    cells = np.full((20, 20), 1)
+    cells[0, 0:3] = 2  # 3 stitches of a near-identical red: folded
+    cells[10, 10:13] = 3  # 3 stitches of a clearly different blue: kept
+    out, folded = fold_rare_threads(cells, pal)
+    assert folded == [2]
+    assert (out == 2).sum() == 0 and (out == 3).sum() == 3
